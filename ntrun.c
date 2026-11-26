@@ -4,6 +4,7 @@
  */
 #define _DARWIN_C_SOURCE
 #define _GNU_SOURCE
+#define _CRT_RAND_S
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -16,19 +17,29 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#ifndef _WIN32
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
+#endif
 #include <sys/stat.h>
 #include <sys/time.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include "win32_compat.h"
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
 #include "ntrun.h"
 
+#ifdef _WIN32
+/* win32_compat.h gives 4096: the limits.h of mingw has 260, too small for the host paths */
+_Static_assert(PATH_MAX >= 4096, "PATH_MAX is too small for host paths");
+#endif
+
+#ifndef _WIN32
 extern char **environ;
+#endif
 
 u8 *G;
 u64 icount;
@@ -45,6 +56,17 @@ static char exe_hdir[PATH_MAX];
 static u32 cmdline_g;
 
 #define GSIZE 0x80000000ull
+#ifdef _WIN32
+#define DLLPATH_SEP ";"
+#define HOST_DRIVE_PATH(h) (isalpha((unsigned char)(h)[0]) && (h)[1] == ':')
+#define HOST_NULL "NUL"
+#define HOST_TTY "CON"
+#else
+#define DLLPATH_SEP ":"
+#define HOST_DRIVE_PATH(h) 0
+#define HOST_NULL "/dev/null"
+#define HOST_TTY "/dev/tty"
+#endif
 #define INVALID 0xffffffffu
 
 void die(const char *fmt, ...)
@@ -62,6 +84,8 @@ void die(const char *fmt, ...)
 /* The end of this process, with the 32-bit exit code of Windows. The parent ntrun reads
    the full code from a pipe; the host only keeps 8 bits. */
 static void exit_files(void);
+static void views_sync(void);
+static void views_sync_fd(int fd);
 void guest_exit(u32 code) __attribute__((noreturn));
 void guest_exit(u32 code)
 {
@@ -72,9 +96,14 @@ void guest_exit(u32 code)
     fflush(stderr);
     if (getenv("NTRUN_STATS"))
         fprintf(stderr, "ntrun: %llu instructions\n", (unsigned long long)icount);
+#ifdef _WIN32
+    (void)s;
+    exit((int)code); /* Windows keeps all 32 bits of the code */
+#else
     if (s && write(atoi(s), &code, 4) != 4)
         s = NULL;
     exit(code && !(code & 0xff) ? 1 : (int)(code & 0xff));
+#endif
 }
 
 /*
@@ -285,6 +314,46 @@ void cpu_fault(u32 code, u32 pc, u32 insn)
     seh_fault(code, pc, 0, 0, 0);
 }
 
+#ifdef _WIN32
+/* The guest code touched memory it must not: go on in a function that jumps back to the
+   call level. The handler sets the program counter to it, with the address of the fault as the
+   return address, so that the unwinder of the C library finds a proper frame. */
+static void __attribute__((noreturn, force_align_arg_pointer)) fault_jump(void)
+{
+    siglongjmp(levels[nlevels - 1].jb, 2);
+}
+
+static LONG CALLBACK on_fault(EXCEPTION_POINTERS *ep)
+{
+    EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    u8 *p;
+
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION && er->ExceptionCode != EXCEPTION_IN_PAGE_ERROR)
+        return EXCEPTION_CONTINUE_SEARCH;
+    p = (u8 *)er->ExceptionInformation[1];
+    if (p >= G && p < G + 0x100000000ull && nlevels > 0 && !in_api) {
+        /* the program's own fault: its exception handlers get it */
+        DWORD64 *sp;
+        fault_addr = (u32)(p - G);
+        fault_write = er->ExceptionInformation[0] == 1;
+        sp = (DWORD64 *)(ep->ContextRecord->Rsp - 8);
+        *sp = ep->ContextRecord->Rip;
+        ep->ContextRecord->Rsp = (DWORD64)sp;
+        ep->ContextRecord->Rip = (DWORD64)(uintptr_t)fault_jump;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    fflush(stdout);
+    if (p >= G && p < G + 0x100000000ull)
+        fprintf(stderr, "ntrun: access violation in the Windows function %s: guest address %08x, called from %08x\n", cur_api,
+            (u32)(p - G), cpu ? cpu->pc() : 0);
+    else
+        fprintf(stderr, "ntrun: host fault at %p%s%s (guest pc=%08x)\n", (void *)p, in_api ? " in the Windows function " : "",
+            in_api ? cur_api : "", cpu ? cpu->pc() : 0);
+    if (cpu && getenv("NTRUN_DUMP"))
+        cpu->dump();
+    _exit(123);
+}
+#else
 static void on_segv(int sig, siginfo_t *si, void *uc)
 {
     u8 *p = (u8 *)si->si_addr;
@@ -331,6 +400,7 @@ static void on_segv(int sig, siginfo_t *si, void *uc)
         cpu->dump();
     _exit(123);
 }
+#endif
 
 static void seterr(u32 e)
 {
@@ -366,6 +436,80 @@ static char *gstr(u32 a) { return a ? (char *)(G + a) : NULL; }
 static u8 rmap[NCHUNK];
 
 static int region_top; /* the next region_alloc(0, ...) takes the highest free place (MEM_TOP_DOWN) */
+
+#ifdef _WIN32
+/*
+ * Windows host: the guest memory is one reservation, and a region is committed when region_alloc
+ * gives it to the program and decommitted (zero again) when region_free takes it back. A view of
+ * a file can only be mapped at a place that is free address space, and a piece of a reservation
+ * cannot be given back. So there is a zone of 32 MB (ZONE_N regions) in which each region of
+ * 64 KB is a reservation of its own. region_alloc never takes it (rmap is 2 there); the views
+ * of files that the program can write take their place in it (region_alloc_zone).
+ */
+#define ZONE_C 0x6e00u /* the first region of the zone (guest address 6e000000) */
+#define ZONE_N 0x200u
+#define IN_ZONE(c) ((c) >= ZONE_C && (c) < ZONE_C + ZONE_N)
+
+static int host_reserve(void)
+{
+    for (int attempt = 0; attempt < 32; attempt++) {
+        u8 *p = VirtualAlloc(NULL, 0x100000000ull, MEM_RESERVE, PAGE_NOACCESS);
+        u32 k;
+
+        if (!p)
+            return 0;
+        VirtualFree(p, 0, MEM_RELEASE);
+        if (!VirtualAlloc(p, (size_t)ZONE_C * CHUNK, MEM_RESERVE, PAGE_NOACCESS))
+            continue;
+        if (!VirtualAlloc(p + (size_t)(ZONE_C + ZONE_N) * CHUNK, 0x100000000ull - (size_t)(ZONE_C + ZONE_N) * CHUNK,
+                MEM_RESERVE, PAGE_NOACCESS)) {
+            VirtualFree(p, 0, MEM_RELEASE);
+            continue;
+        }
+        for (k = 0; k < ZONE_N; k++)
+            if (!VirtualAlloc(p + (size_t)(ZONE_C + k) * CHUNK, CHUNK, MEM_RESERVE, PAGE_NOACCESS))
+                break;
+        if (k == ZONE_N) {
+            G = p;
+            memset(rmap + ZONE_C, 2, ZONE_N);
+            return 1;
+        }
+        /* something else took a place of the hole: give all back, try another hole */
+        while (k--)
+            VirtualFree(p + (size_t)(ZONE_C + k) * CHUNK, 0, MEM_RELEASE);
+        VirtualFree(p, 0, MEM_RELEASE);
+        VirtualFree(p + (size_t)(ZONE_C + ZONE_N) * CHUNK, 0, MEM_RELEASE);
+    }
+    return 0;
+}
+
+static int host_commit(u32 addr, u32 n)
+{
+    if (!IN_ZONE(addr / CHUNK))
+        return VirtualAlloc(G + addr, (size_t)n * CHUNK, MEM_COMMIT, PAGE_READWRITE) != NULL;
+    for (u32 k = 0; k < n; k++)
+        if (!VirtualAlloc(G + addr + (size_t)k * CHUNK, CHUNK, MEM_COMMIT, PAGE_READWRITE)) {
+            while (k--)
+                VirtualFree(G + addr + (size_t)k * CHUNK, CHUNK, MEM_DECOMMIT);
+            return 0;
+        }
+    return 1;
+}
+
+/* the regions have no pages, and are reserved (also those that a view of a file had) */
+static void host_decommit(u32 addr, u32 n)
+{
+    if (!IN_ZONE(addr / CHUNK)) {
+        VirtualFree(G + addr, (size_t)n * CHUNK, MEM_DECOMMIT);
+        return;
+    }
+    for (u32 k = 0; k < n; k++) {
+        u8 *p = G + addr + (size_t)k * CHUNK;
+        VirtualFree(p, CHUNK, MEM_DECOMMIT);
+        VirtualAlloc(p, CHUNK, MEM_RESERVE, PAGE_NOACCESS); /* fails when it is reserved still */
+    }
+}
+#endif
 
 static u32 region_alloc(u32 addr, u32 size)
 {
@@ -404,6 +548,12 @@ static u32 region_alloc(u32 addr, u32 size)
             return 0;
     }
     memset(rmap + c, 1, n);
+#ifdef _WIN32
+    if (!host_commit(c * CHUNK, n)) { /* the host has no memory for it: the program gets the error */
+        memset(rmap + c, 0, n);
+        return 0;
+    }
+#endif
     return c * CHUNK;
 }
 
@@ -414,10 +564,41 @@ static void region_free(u32 addr, u32 size)
     if (!n)
         n = 1;
     memset(rmap + c, 0, n);
+#ifdef _WIN32
+    if (IN_ZONE(c)) /* the zone stays the zone */
+        memset(rmap + c, 2, n);
+#endif
     /* give the host fresh zero pages there */
+#ifdef _WIN32
+    host_decommit(addr, n);
+#else
     if (mmap(G + addr, (size_t)n * CHUNK, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0) == MAP_FAILED)
         die("region_free: mmap: %s", strerror(errno));
+#endif
 }
+
+#ifdef _WIN32
+/* a place for a view of a file: regions of the zone, committed */
+static u32 region_alloc_zone(u32 size)
+{
+    u32 n = (size + CHUNK - 1) / CHUNK, c, k;
+
+    if (!n)
+        n = 1;
+    for (c = ZONE_C; c + n <= ZONE_C + ZONE_N; c++) {
+        for (k = 0; k < n && rmap[c + k] == 2; k++)
+            ;
+        if (k == n) {
+            if (!host_commit(c * CHUNK, n))
+                return 0;
+            memset(rmap + c, 1, n);
+            return c * CHUNK;
+        }
+        c += k;
+    }
+    return 0;
+}
+#endif
 
 /* VirtualAlloc reservations */
 static struct { u32 base, size; } vres[4096];
@@ -673,7 +854,12 @@ static void drives_init(void)
             continue;
         if (!realpath(v, real))
             die("%s: cannot find the folder %s", name, v);
-        drive_dir[i] = strdup(strcmp(real, "/") ? real : "");
+        {
+            size_t l = strlen(real);
+            if (l && real[l - 1] == '/') /* "/" is "", and "C:/" is "C:" */
+                real[l - 1] = 0;
+        }
+        drive_dir[i] = strdup(real);
         ndrives++;
     }
     for (int i = 25; i >= 0; i--)
@@ -697,6 +883,19 @@ static int drive_of(const char *h, const char **rest)
                 bl = l;
             }
         }
+#ifdef _WIN32
+    if (best < 0 && isalpha((unsigned char)h[0]) && h[1] == ':') {
+        static char z[PATH_MAX];
+        if (!ndrives) { /* C:/dir: the drive of the host */
+            *rest = h + 2;
+            return toupper((unsigned char)h[0]);
+        }
+        /* drives of folders are set: the host's drive C: is below the host root, Z:\c\dir */
+        snprintf(z, sizeof z, "/%c%s", tolower((unsigned char)h[0]), h + 2);
+        *rest = z;
+        return root_letter;
+    }
+#endif
     *rest = best < 0 ? h : h + bl;
     return best < 0 ? root_letter : 'A' + best;
 }
@@ -708,6 +907,23 @@ static const char *drive_root(int letter)
     char cwd[PATH_MAX];
     const char *rest;
 
+#ifdef _WIN32
+    {
+        static char wroot[26][3];
+        if (!letter) {
+            if (!getcwd(cwd, sizeof cwd))
+                return "";
+            letter = drive_of(cwd, &rest);
+        }
+        letter = toupper(letter);
+        if (letter < 'A' || letter > 'Z')
+            return "";
+        if (drive_dir[letter - 'A'])
+            return drive_dir[letter - 'A'];
+        snprintf(wroot[letter - 'A'], 3, "%c:", letter); /* a drive of the host is its own folder */
+        return wroot[letter - 'A'];
+    }
+#endif
     if (!ndrives)
         return "";
     if (!letter) {
@@ -732,8 +948,8 @@ static void to_host_plain(const char *g, char *out, size_t n)
         out[0] = 0;
         return;
     }
-    if (!strcasecmp(g, "NUL")) { snprintf(out, n, "/dev/null"); return; }
-    if (!strcasecmp(g, "CON") || !strcasecmp(g, "CONOUT$") || !strcasecmp(g, "CONIN$")) { snprintf(out, n, "/dev/tty"); return; }
+    if (!strcasecmp(g, "NUL")) { snprintf(out, n, "%s", HOST_NULL); return; }
+    if (!strcasecmp(g, "CON") || !strcasecmp(g, "CONOUT$") || !strcasecmp(g, "CONIN$")) { snprintf(out, n, "%s", HOST_TTY); return; }
     if (p[0] == '\\' && p[1] == '\\' && p[2] == '?' && p[3] == '\\')
         p += 4;
     if (isalpha((unsigned char)p[0]) && p[1] == ':') {
@@ -744,6 +960,25 @@ static void to_host_plain(const char *g, char *out, size_t n)
         /* from the root of the drive */
         root = drive_root(letter);
         snprintf(tmp, sizeof tmp, "%s%s", root, p);
+#ifdef _WIN32
+        if (ndrives) { /* Z:\c\dir is C:/dir of the host */
+            char cwd[PATH_MAX];
+            const char *rest;
+            int l = letter;
+            if (!l && getcwd(cwd, sizeof cwd))
+                l = drive_of(cwd, &rest);
+            if (toupper(l) == root_letter) {
+                if (isalpha((unsigned char)p[1]) && (!p[2] || p[2] == 0x5c || p[2] == '/')) {
+                    snprintf(tmp, sizeof tmp, "%c:%s", p[1], p[2] ? p + 2 : "/");
+                } else {
+                    /* Z:\name is not a drive of the host: it is below the root of the system drive
+                       (Z:\windows\system32 is the system folder), not the host's Z: */
+                    const char *sd = getenv("SystemDrive");
+                    snprintf(tmp, sizeof tmp, "%s%s", sd && sd[0] && sd[1] == ':' ? sd : "C:", p);
+                }
+            }
+        }
+#endif
     } else if (letter && ndrives) {
         /* "C:name": below the current folder if that is on the drive, else below the drive's root */
         char cwd[PATH_MAX];
@@ -813,7 +1048,7 @@ void to_guest(const char *h, char *out, size_t n)
     int letter;
     char *s;
 
-    if (h[0] != '/') {
+    if (h[0] != '/' && !(HOST_DRIVE_PATH(h))) {
         char cwd[PATH_MAX];
         if (!getcwd(cwd, sizeof cwd))
             snprintf(cwd, sizeof cwd, "/");
@@ -941,6 +1176,7 @@ struct hnd {
     u32 owner;         /* a mutex: the thread that has it */
     s32 max;           /* a semaphore: its highest count */
     pid_t pid;
+    intptr_t proc; /* Windows host: the handle of the process that a child ntrun runs in */
     char *path;
     u32 prot, size;
     s32 count;
@@ -1133,7 +1369,11 @@ static int find_dll(const char *name, char *out, size_t n)
         return 1;
     if ((p = getenv("NTRUN_DLLPATH"))) {
         while (*p) {
+#ifdef _WIN32
+            size_t l = strcspn(p, ";"); /* a drive letter has the other one */
+#else
             size_t l = strcspn(p, ":");
+#endif
             snprintf(dir, sizeof dir, "%.*s", (int)l, p);
             if (find_file(dir, name, out, n))
                 return 1;
@@ -1546,9 +1786,25 @@ API(GetOEMCP) { UNUSED; return 437; }
 API(IsValidCodePage) { return a[0] == 1252 || a[0] == 437; }
 API(IsValidLocale) { UNUSED; return 1; }
 API(GetUserDefaultLCID) { UNUSED; return 0x409; }
-API(IsBadReadPtr) { return a[0] < 0x10000 || (u64)a[0] + a[1] > GSIZE; }
-API(IsBadWritePtr) { return a[0] < 0x10000 || (u64)a[0] + a[1] > GSIZE; }
-API(IsBadCodePtr) { return a[0] < 0x10000 || a[0] >= GSIZE; }
+/* Is the memory from ADDR for LEN bytes the program's? Everywhere else the host gives each address from
+   0x10000 to 2 GB. On a Windows host only the regions that the program got are there: the rest faults. */
+static int guest_ok(u32 addr, u32 len)
+{
+    u64 end = (u64)addr + len;
+
+    if (addr < 0x10000 || end > GSIZE)
+        return 0;
+#ifdef _WIN32
+    for (u32 c = addr / CHUNK; c <= (u32)((end - (len ? 1 : 0)) / CHUNK); c++)
+        if (c >= NCHUNK || rmap[c] != 1)
+            return 0;
+#endif
+    return 1;
+}
+
+API(IsBadReadPtr) { return !guest_ok(a[0], a[1]); }
+API(IsBadWritePtr) { return !guest_ok(a[0], a[1]); }
+API(IsBadCodePtr) { return !guest_ok(a[0], 1); }
 
 /* ExitProcess tells each DLL that the program ends (reason 0), the DLL that started last first.
    The C runtime DLL of 2005 writes the rest of the output of the program at that time. */
@@ -1869,6 +2125,7 @@ API(CreateFileA)
 /* at the end of the program: remove the files that were to be deleted when closed and are open still */
 static void exit_files(void)
 {
+    views_sync();
     for (u32 i = 0; i < NHND; i++)
         if (H[i].type == HT_FILE && H[i].delete_on_close && H[i].path)
             unlink(H[i].path);
@@ -1876,6 +2133,8 @@ static void exit_files(void)
 
 static void hclose(struct hnd *x)
 {
+    if ((x->type == HT_FILE || x->type == HT_MAP) && x->fd >= 0)
+        views_sync_fd(x->fd);
     switch (x->type) {
     case HT_FILE:
     case HT_MAP:
@@ -1911,6 +2170,8 @@ API(ReadFile)
 {
     int fd = hfd(a[0]), blk, e;
     struct thread *me = cur;
+
+    views_sync_fd(fd);
     struct stat st;
     ssize_t n;
 
@@ -1947,6 +2208,8 @@ API(WriteFile)
 {
     int fd = hfd(a[0]);
     u32 done = 0;
+
+    views_sync_fd(fd);
 
     if (a[3])
         w32(a[3], 0);
@@ -2597,13 +2860,24 @@ API(GetLocalTime)
 
 API(SetLocalTime) { UNUSED; seterr(5); return 0; }
 
+/* seconds east of UTC for the broken-down local time TM (the zone, with summer time) */
+static long host_gmtoff(const struct tm *tm)
+{
+#ifdef _WIN32
+    /* the Windows struct tm has no tm_gmtoff */
+    return nt_gmtoff(tm);
+#else
+    return tm->tm_gmtoff;
+#endif
+}
+
 API(GetTimeZoneInformation)
 {
     time_t t = time(NULL);
     struct tm tm;
     localtime_r(&t, &tm);
     memset(G + a[0], 0, 172);
-    w32(a[0], (u32)(s32)(-tm.tm_gmtoff / 60));
+    w32(a[0], (u32)(s32)(-host_gmtoff(&tm) / 60));
     return 0;
 }
 
@@ -2635,7 +2909,7 @@ static s64 local_offset(time_t t)
 {
     struct tm tm;
     localtime_r(&t, &tm);
-    return (s64)tm.tm_gmtoff * 10000000ll;
+    return (s64)host_gmtoff(&tm) * 10000000ll;
 }
 
 API(FileTimeToLocalFileTime)
@@ -2895,8 +3169,83 @@ API(GetModuleFileNameA)
 }
 
 /* file mappings */
-static struct { u32 addr, len; } views[256];
+static struct {
+    u32 addr, len, off;
+    int fd;
+    int copy;   /* Windows host, no mapping: a copy in memory that is written back to the file */
+    int mapped; /* Windows host: a real view of the file at that address (MapViewOfFileEx) */
+    u64 vol, idx; /* which file (a copy) */
+} views[256];
 static int nviews;
+
+#ifdef _WIN32
+/* the number of the file of a file descriptor: the same file has the same number */
+static int file_number(int fd, u64 *vol, u64 *idx)
+{
+    BY_HANDLE_FILE_INFORMATION i;
+
+    if (!GetFileInformationByHandle((HANDLE)_get_osfhandle(fd), &i))
+        return 0;
+    *vol = i.dwVolumeSerialNumber;
+    *idx = ((u64)i.nFileIndexHigh << 32) | i.nFileIndexLow;
+    return 1;
+}
+
+/* A view of a file that can be written is a real view when the host can map the file at
+   the address of the guest. Where it cannot (the file is not open for writing, the offset
+   is not a multiple of 64 KB), the view is a copy in memory: the file gets the copy back
+   when the program flushes, reads or writes the file, closes it or ends. */
+static void views_sync_one(int i)
+{
+    if (views[i].copy && views[i].fd >= 0)
+        pwrite(views[i].fd, G + views[i].addr, views[i].len, views[i].off);
+}
+
+static void views_sync(void)
+{
+    for (int i = 0; i < nviews; i++)
+        views_sync_one(i);
+}
+
+static void views_sync_fd(int fd)
+{
+    u64 vol, idx;
+
+    if (fd < 0 || !nviews || !file_number(fd, &vol, &idx))
+        return;
+    for (int i = 0; i < nviews; i++)
+        if (views[i].copy && views[i].vol == vol && views[i].idx == idx)
+            views_sync_one(i);
+}
+
+/* map the file of FD at the guest address ADDR (regions of 64 KB that region_alloc gave) */
+static int map_view(int fd, u32 addr, u32 len, u32 off)
+{
+    HANDLE sec;
+    u32 n = (len + CHUNK - 1) / CHUNK;
+    void *p;
+
+    if (off & (CHUNK - 1)) /* a view starts at a multiple of 64 KB */
+        return 0;
+    sec = CreateFileMappingA((HANDLE)_get_osfhandle(fd), NULL, PAGE_READWRITE, 0, 0, NULL);
+    if (!sec)
+        return 0;
+    for (u32 k = 0; k < n; k++)
+        VirtualFree(G + addr + (size_t)k * CHUNK, 0, MEM_RELEASE); /* the places are free now */
+    p = MapViewOfFileEx(sec, FILE_MAP_WRITE, 0, off, len, G + addr);
+    CloseHandle(sec); /* the view keeps the file mapping */
+    if (p == G + addr)
+        return 1;
+    if (p)
+        UnmapViewOfFile(p);
+    host_decommit(addr, n);
+    host_commit(addr, n);
+    return 0;
+}
+#else
+static void views_sync(void) {}
+static void views_sync_fd(int fd) { (void)fd; }
+#endif
 
 API(CreateFileMappingA)
 {
@@ -2936,7 +3285,7 @@ API(MapViewOfFileEx)
 {
     struct hnd *x = hget(a[0]);
     u32 off = a[3], len = a[4], addr;
-    size_t hlen, ps = (size_t)getpagesize();
+    int shared = 0, mapped = 0;
 
     if (!x || x->type != HT_MAP) {
         seterr(6);
@@ -2944,13 +3293,34 @@ API(MapViewOfFileEx)
     }
     if (!len)
         len = x->size - off;
-    addr = region_alloc(a[5], len);
+    addr = 0;
+#ifdef _WIN32
+    /* a view of a file that the program can write goes to the zone, where it can be mapped */
+    if (!a[5] && x->fd >= 0 && (a[1] & 2))
+        addr = region_alloc_zone(len);
+#endif
+    if (!addr)
+        addr = region_alloc(a[5], len);
     if (!addr) {
         seterr(487);
         return 0;
     }
     if (x->fd >= 0) {
-        int shared = (a[1] & 2) != 0; /* FILE_MAP_WRITE; FILE_MAP_ALL_ACCESS has it too */
+        shared = (a[1] & 2) != 0; /* FILE_MAP_WRITE; FILE_MAP_ALL_ACCESS has it too */
+#ifdef _WIN32
+        if (shared && IN_ZONE(addr / CHUNK))
+            mapped = map_view(x->fd, addr, len, off);
+        if (!mapped) {
+            /* a private view, or one that cannot be mapped: a copy. A copy that can be written
+               is written back to the file (views_sync) */
+            if (pread(x->fd, G + addr, len, off) < 0) {
+                region_free(addr, len);
+                seterr(werr(errno));
+                return 0;
+            }
+        }
+#else
+        size_t hlen, ps = (size_t)getpagesize();
         hlen = ((size_t)len + ps - 1) & ~(ps - 1);
         if ((off % ps) != 0 || mmap(G + addr, hlen, PROT_READ | PROT_WRITE, MAP_FIXED | (shared ? MAP_SHARED : MAP_PRIVATE), x->fd, off) == MAP_FAILED) {
             /* cannot map: read it */
@@ -2962,11 +3332,22 @@ API(MapViewOfFileEx)
                 return 0;
             }
         }
+#endif
     }
     if (nviews == 256)
         die("too many file views");
     views[nviews].addr = addr;
     views[nviews].len = len;
+    views[nviews].off = off;
+    views[nviews].mapped = mapped;
+    views[nviews].copy = 0;
+    views[nviews].fd = -1;
+#ifdef _WIN32
+    if (shared && !mapped && file_number(x->fd, &views[nviews].vol, &views[nviews].idx)) {
+        views[nviews].copy = 1;
+        views[nviews].fd = dup(x->fd); /* the view outlives the handle */
+    }
+#endif
     nviews++;
     return addr;
 }
@@ -2977,6 +3358,13 @@ API(UnmapViewOfFile)
 {
     for (int i = 0; i < nviews; i++)
         if (views[i].addr == a[0]) {
+#ifdef _WIN32
+            views_sync_one(i);
+            if (views[i].fd >= 0)
+                close(views[i].fd);
+            if (views[i].mapped)
+                UnmapViewOfFile(G + views[i].addr);
+#endif
             region_free(views[i].addr, views[i].len);
             views[i] = views[--nviews];
             return 1;
@@ -2987,6 +3375,105 @@ API(UnmapViewOfFile)
 
 /* processes */
 
+#ifdef _WIN32
+/* A child ntrun is a new process of the host (there is no fork) with the environment that
+   its program gets. The exit code comes whole from the process, no pipe for it. */
+struct envv { char **v; int n; };
+
+static size_t envv_namelen(const char *t)
+{
+    const char *eq = strchr(t + (t[0] == '='), '=');
+    return eq ? (size_t)(eq - t) : strlen(t);
+}
+
+static void envv_unset(struct envv *e, const char *name, size_t len)
+{
+    for (int i = 0; i < e->n; i++)
+        if (envv_namelen(e->v[i]) == len && !_strnicmp(e->v[i], name, len)) {
+            free(e->v[i]);
+            e->v[i] = e->v[--e->n];
+            i--;
+        }
+}
+
+static void envv_set(struct envv *e, const char *text)
+{
+    envv_unset(e, text, envv_namelen(text));
+    e->v = realloc(e->v, sizeof *e->v * (size_t)(e->n + 2));
+    e->v[e->n++] = strdup(text);
+}
+
+static void envv_init(struct envv *e)
+{
+    e->v = NULL;
+    e->n = 0;
+    for (char **p = environ; p && *p; p++) {
+        e->v = realloc(e->v, sizeof *e->v * (size_t)(e->n + 2));
+        e->v[e->n++] = strdup(*p);
+    }
+}
+
+static void envv_free(struct envv *e)
+{
+    for (int i = 0; i < e->n; i++)
+        free(e->v[i]);
+    free(e->v);
+}
+
+/* start ntrun with the program HP; the environment is E. MODE: _P_WAIT (the result is the exit
+   code) or _P_NOWAIT (the handle of the process). -1: it did not start */
+static intptr_t spawn_ntrun(int mode, const char *hp, struct envv *e)
+{
+    /* _spawnve does not work with this C library: the environment of this process is the new
+       one while the child starts, then it is as it was */
+    char a0[PATH_MAX + 4], a1[PATH_MAX + 4], *argv[3] = { a0, a1, NULL };
+    struct envv old;
+    intptr_t r;
+
+    snprintf(a0, sizeof a0, "\"%s\"", self_path);
+    snprintf(a1, sizeof a1, "\"%s\"", hp);
+    envv_init(&old);
+    for (int i = 0; i < old.n; i++) {
+        size_t l = envv_namelen(old.v[i]);
+        int keep = 0;
+        if (old.v[i][0] == '=')
+            continue;
+        for (int k = 0; k < e->n && !keep; k++)
+            keep = envv_namelen(e->v[k]) == l && !_strnicmp(e->v[k], old.v[i], l);
+        if (!keep) {
+            char name[512];
+            snprintf(name, sizeof name, "%.*s", (int)l, old.v[i]);
+            _putenv_s(name, "");
+        }
+    }
+    for (int i = 0; i < e->n; i++)
+        if (e->v[i][0] != '=')
+            _putenv(e->v[i]);
+    fflush(stdout);
+    fflush(stderr);
+    r = _spawnv(mode, self_path, (const char *const *)argv);
+    for (int i = 0; i < e->n; i++) {
+        size_t l = envv_namelen(e->v[i]);
+        int keep = 0;
+        if (e->v[i][0] == '=')
+            continue;
+        for (int k = 0; k < old.n && !keep; k++)
+            keep = envv_namelen(old.v[k]) == l && !_strnicmp(old.v[k], e->v[i], l);
+        if (!keep) {
+            char name[512];
+            snprintf(name, sizeof name, "%.*s", (int)l, e->v[i]);
+            _putenv_s(name, "");
+        }
+    }
+    for (int i = 0; i < old.n; i++)
+        if (old.v[i][0] != '=')
+            _putenv(old.v[i]);
+    envv_free(&old);
+    return r;
+}
+
+static void exit_pipe(int ep[2]) { ep[0] = ep[1] = -1; }
+#else
 /* a pipe brings the 32-bit exit code of a child ntrun to its parent (see guest_exit) */
 static void exit_pipe(int ep[2])
 {
@@ -3023,6 +3510,7 @@ static u32 exit_pipe_code(int fd, int st) /* in the parent, when the child has e
         return code;
     return WIFEXITED(st) ? (u32)WEXITSTATUS(st) : STATUS_ACCESS_VIOLATION;
 }
+#endif
 
 int find_program(const char *name, char *out, size_t n)
 {
@@ -3070,6 +3558,9 @@ API(CreateProcessA)
     u32 si = a[8], pi = a[9], hp_, ht;
     pid_t pid;
     int ep[2];
+#ifdef _WIN32
+    intptr_t proc_h = 0;
+#endif
     u32 sh[3] = { std_h[0], std_h[1], std_h[2] };
 
     if (a[0]) {
@@ -3106,6 +3597,76 @@ API(CreateProcessA)
     fflush(stdout);
     fflush(stderr);
     exit_pipe(ep);
+#ifdef _WIN32
+    {
+        struct envv ev;
+        char buf[64], cwd0[PATH_MAX] = "", *map;
+        size_t o = 0;
+        intptr_t proc;
+
+        envv_init(&ev);
+        /* the child's environment: the guest's, as it is */
+        if (a[6]) {
+            const char *e = gstr(a[6]);
+            for (int i = 0; i < ngenv; i++)
+                if (genv[i][0] != '=')
+                    envv_unset(&ev, genv[i], envv_namelen(genv[i]));
+            while (*e) {
+                envv_set(&ev, e);
+                e += strlen(e) + 1;
+            }
+        } else {
+            for (int i = 0; i < ngenv; i++)
+                if (genv[i][0] != '=')
+                    envv_set(&ev, genv[i]);
+        }
+        envv_set(&ev, "NTRUN_CHILD=1");
+        map = malloc(strlen(cmd ? cmd : prog) + 16);
+        sprintf(map, "NTRUN_CMDLINE=%s", cmd ? cmd : prog);
+        envv_set(&ev, map);
+        free(map);
+        snprintf(buf, sizeof buf, "NTRUN_STD=%u,%u,%u", sh[0], sh[1], sh[2]);
+        envv_set(&ev, buf);
+        map = malloc((size_t)NHND * 24 + 16);
+        o = (size_t)sprintf(map, "NTRUN_HMAP=");
+        for (u32 i = 0; i < NHND; i++)
+            if (H[i].type == HT_FILE)
+                o += (size_t)sprintf(map + o, "%u:%d,", HBASE + i * 4, H[i].fd);
+        envv_set(&ev, map);
+        free(map);
+        if (si && r16(si + 50) && r32(si + 52)) {
+            u32 n = r16(si + 50), p = r32(si + 52);
+            char *hex = malloc(n * 2 + 16);
+            o = (size_t)sprintf(hex, "NTRUN_RES2=");
+            for (u32 i = 0; i < n; i++)
+                o += (size_t)sprintf(hex + o, "%02x", r8(p + i));
+            envv_set(&ev, hex);
+            free(hex);
+        } else {
+            envv_unset(&ev, "NTRUN_RES2", 10);
+        }
+        if (a[7]) {
+            char cwd[PATH_MAX];
+            to_host(gstr(a[7]), cwd, sizeof cwd);
+            getcwd(cwd0, sizeof cwd0);
+            if (chdir(cwd) < 0) {
+                envv_free(&ev);
+                seterr(267); /* ERROR_DIRECTORY */
+                return 0;
+            }
+        }
+        proc = spawn_ntrun(_P_NOWAIT, hp, &ev);
+        if (cwd0[0])
+            chdir(cwd0);
+        envv_free(&ev);
+        if (proc == -1) {
+            seterr(errno == ENOENT ? 2 : 8);
+            return 0;
+        }
+        pid = (pid_t)GetProcessId((HANDLE)proc);
+        proc_h = proc;
+    }
+#else
     pid = fork();
     if (pid < 0) {
         seterr(8);
@@ -3168,10 +3729,14 @@ API(CreateProcessA)
         fprintf(stderr, "ntrun: cannot run %s: %s\n", self_path, strerror(errno));
         _exit(127);
     }
+#endif
     if (ep[1] >= 0)
         close(ep[1]);
     hp_ = hnew(HT_PROC);
     hget(hp_)->pid = pid;
+#ifdef _WIN32
+    hget(hp_)->proc = proc_h;
+#endif
     hget(hp_)->fd = ep[0];
     ht = hnew(HT_THREAD);
     hget(ht)->thr = -1; /* a thread of the other process */
@@ -3233,6 +3798,19 @@ static void reap(struct hnd *x, int block)
 
     if (x->done)
         return;
+#ifdef _WIN32
+    {
+        DWORD code = 1;
+        if (WaitForSingleObject((HANDLE)x->proc, block ? INFINITE : 0) == WAIT_OBJECT_0) {
+            GetExitCodeProcess((HANDLE)x->proc, &code);
+            x->done = 1;
+            x->status = (int)code;
+            CloseHandle((HANDLE)x->proc);
+        }
+        (void)st;
+        (void)r;
+    }
+#else
     do
         r = waitpid(x->pid, &st, block ? 0 : WNOHANG);
     while (r < 0 && errno == EINTR);
@@ -3244,6 +3822,7 @@ static void reap(struct hnd *x, int block)
         x->done = 1;
         x->status = 1;
     }
+#endif
 }
 
 /* Is the thing behind a handle signaled? TAKE: a wait ends with it, so it changes:
@@ -3649,7 +4228,7 @@ API(CharLowerA)
 }
 API(CharUpperBuffA) { for (u32 i = 0; i < a[1]; i++) w8(a[0] + i, (u8)mapchar(r8(a[0] + i), 0x200)); return a[1]; }
 API(CharLowerBuffA) { for (u32 i = 0; i < a[1]; i++) w8(a[0] + i, (u8)mapchar(r8(a[0] + i), 0x100)); return a[1]; }
-API(IsBadStringPtrA) { return a[0] < 0x10000 || a[0] >= GSIZE; }
+API(IsBadStringPtrA) { return !guest_ok(a[0], 1); }
 API(OutputDebugStringA) { UNUSED; return 0; }
 API(SendMessageW) { UNUSED; return 0; }
 API(GlobalLock) { return a[0]; }
@@ -3663,7 +4242,7 @@ API(SetConsoleTitleA) { UNUSED; return 1; }
 API(SetThreadPriority) { UNUSED; return 1; }
 API(GetThreadPriority) { UNUSED; return 0; }
 API(SetPriorityClass) { UNUSED; return 1; }
-API(FlushViewOfFile) { UNUSED; return 1; }
+API(FlushViewOfFile) { UNUSED; views_sync(); return 1; }
 API(FlushInstructionCache) { UNUSED; return 1; }
 API(GetProcessAffinityMask) { if (a[1]) w32(a[1], 1); if (a[2]) w32(a[2], 1); return 1; }
 
@@ -3975,17 +4554,17 @@ API(VirtualQuery)
         seterr(87);
         return 0;
     }
-    for (abase = c; abase > 0 && rmap[abase - 1] == rmap[c]; abase--)
+    for (abase = c; abase > 0 && (rmap[abase - 1] == 1) == (rmap[c] == 1); abase--)
         ;
-    for (n = c; n < NCHUNK && rmap[n] == rmap[c]; n++)
+    for (n = c; n < NCHUNK && (rmap[n] == 1) == (rmap[c] == 1); n++)
         ;
     w32(p, base);
     w32(p + 4, abase * CHUNK);
     w32(p + 8, 4);
     w32(p + 12, n * CHUNK - base);
-    w32(p + 16, rmap[c] ? 0x1000 : 0x10000); /* MEM_COMMIT or MEM_FREE */
-    w32(p + 20, rmap[c] ? 4 : 1);
-    w32(p + 24, rmap[c] ? 0x20000 : 0);
+    w32(p + 16, (rmap[c] == 1) ? 0x1000 : 0x10000); /* MEM_COMMIT or MEM_FREE */
+    w32(p + 20, (rmap[c] == 1) ? 4 : 1);
+    w32(p + 24, (rmap[c] == 1) ? 0x20000 : 0);
     return 28;
 }
 
@@ -4038,6 +4617,7 @@ static void thread_finish(struct thread *t, u32 code)
         guest_exit(code);
     cpu_free();
     pthread_exit(NULL);
+    __builtin_unreachable();
 }
 
 static void *thread_host(void *arg)
@@ -4226,6 +4806,15 @@ API(WritePrivateProfileStringA) { UNUSED; return 1; }
 /* RPCRT4: uuidgen needs these three */
 API(UuidCreate)
 {
+#ifdef _WIN32
+    /* rand() has 15 bits: take the bytes from rand_s */
+    for (int i = 0; i < 16; i++) {
+        unsigned int v;
+        if (rand_s(&v) != 0)
+            v = (unsigned)rand();
+        w8(a[0] + (u32)i, (u8)(v >> 8));
+    }
+#else
     static int seeded;
     if (!seeded) {
         srandom((unsigned)(time(NULL) ^ getpid()));
@@ -4233,6 +4822,7 @@ API(UuidCreate)
     }
     for (int i = 0; i < 16; i++)
         w8(a[0] + (u32)i, (u8)(random() >> 8));
+#endif
     w8(a[0] + 7, (u8)((r8(a[0] + 7) & 0x0f) | 0x40)); /* version 4, in the little-endian third field */
     w8(a[0] + 8, (u8)((r8(a[0] + 8) & 0x3f) | 0x80));
     return 0;
@@ -5509,12 +6099,21 @@ API(CryptAcquireContextW) { w32(a[0], 0xc0de0001); return 1; }
 API(CryptReleaseContext) { UNUSED; return 1; }
 API(CryptGenRandom) /* (provider, length, buffer) */
 {
+#ifdef _WIN32
+    for (u32 i = 0; i < a[1]; i++) {
+        unsigned int v;
+        if (rand_s(&v) != 0)
+            v = (unsigned)rand();
+        w8(a[2] + i, (u8)(v >> 8));
+    }
+#else
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd < 0 || read(fd, G + a[2], a[1]) != (ssize_t)a[1])
         for (u32 i = 0; i < a[1]; i++)
             w8(a[2] + i, (u8)(random() >> 8));
     if (fd >= 0)
         close(fd);
+#endif
     return 1;
 }
 API(CryptCreateHash) /* (provider, algorithm, key, flags, the new handle) */
@@ -5744,10 +6343,61 @@ int api_argbytes(u32 index)
 
 /* ---------------- the command processor (cmd.c) ---------------- */
 
+#ifdef _WIN32
+static intptr_t spawn_program(int mode, const char *hp, const char *line)
+{
+    {
+        struct envv ev;
+        char *text;
+        intptr_t r;
+
+        envv_init(&ev);
+        /* the environment of the child: only what the command processor has now */
+        for (int i = ev.n - 1; i >= 0; i--)
+            if (strncmp(ev.v[i], "NTRUN_", 6) && ev.v[i][0] != '=') {
+                free(ev.v[i]);
+                ev.v[i] = ev.v[--ev.n];
+            }
+        for (int i = 0; i < ngenv; i++)
+            if (genv[i][0] != '=')
+                envv_set(&ev, genv[i]);
+        envv_set(&ev, "NTRUN_CHILD=1");
+        text = malloc(strlen(line) + 16);
+        sprintf(text, "NTRUN_CMDLINE=%s", line);
+        envv_set(&ev, text);
+        free(text);
+        envv_unset(&ev, "NTRUN_STD", 9);
+        envv_unset(&ev, "NTRUN_HMAP", 10);
+        envv_unset(&ev, "NTRUN_RES2", 10);
+        r = spawn_ntrun(mode, hp, &ev);
+        envv_free(&ev);
+        return r;
+    }
+}
+
+/* the command processor starts a program and goes on; wait_program gives its exit code */
+intptr_t start_program(const char *hp, const char *line) { return spawn_program(_P_NOWAIT, hp, line); }
+
+u32 wait_program(intptr_t proc)
+{
+    DWORD code = 1;
+
+    WaitForSingleObject((HANDLE)proc, INFINITE);
+    GetExitCodeProcess((HANDLE)proc, &code);
+    CloseHandle((HANDLE)proc);
+    return code;
+}
+#endif
+
 /* Run the program HP (a host path) with the command line LINE in a new ntrun, wait for it,
    and give its exit code. The program gets the environment as it is now. */
 u32 run_program(const char *hp, const char *line)
 {
+#ifdef _WIN32
+    intptr_t r = spawn_program(_P_WAIT, hp, line);
+
+    return r == -1 ? 127 : (u32)r;
+#else
     pid_t pid;
     int st, ep[2];
 
@@ -5790,6 +6440,7 @@ u32 run_program(const char *hp, const char *line)
     while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
         ;
     return exit_pipe_code(ep[0], st);
+#endif
 }
 
 static u32 cmd_main(const char *cmdline)
@@ -5821,7 +6472,9 @@ static void quote_arg(char *out, size_t n, const char *arg)
 
 int main(int argc, char **argv)
 {
+#ifndef _WIN32
     struct sigaction sa;
+#endif
     struct module *exe;
     const char *s;
     char buf[PATH_MAX * 2], *cl;
@@ -5843,7 +6496,7 @@ int main(int argc, char **argv)
             "  program: a file (tools/CL.EXE), or a name (cl) to find in the folders of NTRUN_PATH\n"
             "  -a  print each Win32 call (-a -a: also before the call)   -t  print each instruction\n"
             "  NTRUN_PATH     the PATH of the program: Windows folders with ; between them\n"
-            "  NTRUN_DLLPATH  host folders with DLLs, with : between them\n");
+            "  NTRUN_DLLPATH  host folders with DLLs, with " DLLPATH_SEP " between them\n");
         return 2;
     }
 #ifdef __APPLE__
@@ -5853,11 +6506,27 @@ int main(int argc, char **argv)
         if (_NSGetExecutablePath(tmp, &n) != 0 || !realpath(tmp, self_path))
             snprintf(self_path, sizeof self_path, "%s", argv[0]);
     }
+#elif defined(_WIN32)
+    if (!GetModuleFileNameA(NULL, self_path, sizeof self_path))
+        snprintf(self_path, sizeof self_path, "%s", argv[0]);
+    for (char *p = self_path; *p; p++)
+        if (*p == '\\')
+            *p = '/';
+    /* files are binary: no CR LF translation, no end of file at ^Z */
+    _set_fmode(_O_BINARY);
+    for (int i = 0; i < 3; i++)
+        _setmode(i, _O_BINARY);
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
 #else
     if (!realpath("/proc/self/exe", self_path))
         snprintf(self_path, sizeof self_path, "%s", argv[0]);
 #endif
 
+#ifdef _WIN32
+    if (!host_reserve())
+        die("cannot reserve the guest address space: error %lu", GetLastError());
+    AddVectoredExceptionHandler(1, on_fault);
+#else
     G = mmap(NULL, 0x100000000ull, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
     if (G == MAP_FAILED)
         die("cannot reserve the guest address space: %s", strerror(errno));
@@ -5869,14 +6538,21 @@ int main(int argc, char **argv)
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     drives_init();
 
     /* reserved: the thunks and the MIPS user PCR page */
     rmap[THUNK_BASE / CHUNK] = 1;
-    seh_init();
     rmap[0x7fff0000 / CHUNK] = 1;
     rmap[0x7ffe0000 / CHUNK] = 1;
+#ifdef _WIN32
+    /* also the region below the thunks: a walk up the stack reads the word before a return address */
+    if (!host_commit(THUNK_BASE - CHUNK, 1) || !host_commit(THUNK_BASE, 1) || !host_commit(0x7fff0000, 1) ||
+        !host_commit(0x7ffe0000, 1))
+        die("cannot commit the guest memory: error %lu", GetLastError());
+#endif
+    seh_init();
     apis[0].name = "(return)";
     napis = 1;
     for (size_t i = 0; i < sizeof builtin / sizeof builtin[0]; i++)
@@ -5928,6 +6604,11 @@ int main(int argc, char **argv)
                     !strncmp(*e, "SHELL=", 6) || !strncmp(*e, "SHLVL=", 6) || !strncmp(*e, "PWD=", 4) ||
                     !strncmp(*e, "OLDPWD=", 7) || !strncmp(*e, "_=", 2) || !strncmp(*e, "TERM=", 5))
                 continue;
+#ifdef _WIN32
+            /* the host's own command processor is not a program of the guest: ntrun's is */
+            if (!_strnicmp(*e, "COMSPEC=", 8) || !_strnicmp(*e, "PATH=", 5))
+                continue;
+#endif
             if (strncmp(*e, "NTRUN_", 6) && strncmp(*e, "PATH=", 5) && strncmp(*e, "WINEPATH=", 9)) {
                 genv = realloc(genv, sizeof *genv * (size_t)(ngenv + 2));
                 genv[ngenv++] = strdup(*e);

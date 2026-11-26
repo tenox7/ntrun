@@ -7,6 +7,12 @@
 #include <setjmp.h>
 #include "ntrun.h"
 
+#if defined(_WIN32) && !defined(_UCRT)
+/* the fma of msvcrt.dll (MINGW64) is not exactly rounded: the multiply-add of the PowerPC is */
+#include "softfma.h"
+#define fma soft_fma
+#endif
+
 static struct {
     u32 r[32];
     u64 f[32];
@@ -344,22 +350,27 @@ static void ppc_run(void)
             int single = (i >> 26) == 59;
             u32 x5 = (i >> 1) & 31, fc = (i >> 6) & 31;
             double a = fd(P.f[ra]), b = fd(P.f[rb]), c = fd(P.f[fc]), res;
+            int innan = 0; /* an operand that the instruction uses is a NaN */
             if (x5 >= 18 && x5 != 19 && x5 != 24 + (single ? 99 : 0) && x5 != 27) {
                 switch (x5) {
-                case 18: res = a / b; break;
-                case 20: res = a - b; break;
-                case 21: res = a + b; break;
-                case 22: res = sqrt(b); break;
-                case 23: res = a >= 0.0 ? c : b; break;
-                case 24: res = 1.0 / b; break;
-                case 25: res = a * c; break;
-                case 26: res = 1.0 / sqrt(b); break;
-                case 28: res = fma(a, c, -b); break;
-                case 29: res = fma(a, c, b); break;
-                case 30: res = -fma(a, c, -b); break;
-                case 31: res = -fma(a, c, b); break;
+                case 18: res = a / b; innan = isnan(a) || isnan(b); break;
+                case 20: res = a - b; innan = isnan(a) || isnan(b); break;
+                case 21: res = a + b; innan = isnan(a) || isnan(b); break;
+                case 22: res = sqrt(b); innan = isnan(b); break;
+                case 23: res = a >= 0.0 ? c : b; innan = 1; break; /* a select: no new NaN */
+                case 24: res = 1.0 / b; innan = isnan(b); break;
+                case 25: res = a * c; innan = isnan(a) || isnan(c); break;
+                case 26: res = 1.0 / sqrt(b); innan = isnan(b); break;
+                case 28: res = fma(a, c, -b); innan = isnan(a) || isnan(b) || isnan(c); break;
+                case 29: res = fma(a, c, b); innan = isnan(a) || isnan(b) || isnan(c); break;
+                case 30: res = -fma(a, c, -b); innan = isnan(a) || isnan(b) || isnan(c); break;
+                case 31: res = -fma(a, c, b); innan = isnan(a) || isnan(b) || isnan(c); break;
                 default: cpu_fault(STATUS_ILLEGAL_INSTRUCTION, pc, i);
                 }
+                /* an invalid operation gives the default NaN of the PowerPC (positive); an x86 host gives
+                   a negative one. Only the operands that the instruction uses count: the others are f0. */
+                if (isnan(res) && !innan)
+                    res = __builtin_nan("");
                 if (single)
                     res = (double)(float)res;
                 P.f[rt] = df(res);

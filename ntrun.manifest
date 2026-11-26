@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- The manifest of ntrun.exe (Windows host): paths longer than 259 characters.
+     Windows also needs LongPathsEnabled=1 in the registry
+     (HKLM\SYSTEM\CurrentControlSet\Control\FileSystem); without it the limit is 259 as before. -->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings xmlns:ws2="http://schemas.microsoft.com/SMI/2016/WindowsSettings">
+      <ws2:longPathAware>true</ws2:longPathAware>
+    </windowsSettings>
+  </application>
+</assembly>

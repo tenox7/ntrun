@@ -1,0 +1,8 @@
+1 file sees the view: [written through the view]
+2 view sees WriteFile: [from WriteFile]
+3 second view: [written through the view]
+4 first view sees: Z
+5 size 131072
+6 file: [written through the view]
+7 file: [from WriteFile]
+8 file: Z

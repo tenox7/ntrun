@@ -1,3 +1,5 @@
 /ntrun
 /ntrun-new
 *.dSYM
+/ntrun.exe
+/ntrun_res.o

@@ -47,6 +47,21 @@ static inline void w64(u32 a, u64 v) { memcpy(G + a, &v, 8); }
 #define IN_THUNKS(pc) ((pc) >= THUNK_BASE && (pc) < THUNK_BASE + THUNK_MAX * THUNK_SLOT)
 
 /* Windows status codes */
+#ifdef _WIN32 /* windows.h has these with other types */
+#undef STATUS_BREAKPOINT
+#undef STATUS_LONGJUMP
+#undef STATUS_ACCESS_VIOLATION
+#undef STATUS_ILLEGAL_INSTRUCTION
+#undef STATUS_UNWIND
+#undef STATUS_INTEGER_DIVIDE_BY_ZERO
+#undef STATUS_INTEGER_OVERFLOW
+#undef STATUS_PRIVILEGED_INSTRUCTION
+#undef STATUS_FLOAT_DIVIDE_BY_ZERO
+#undef STATUS_FLOAT_INVALID_OPERATION
+#undef STATUS_FLOAT_OVERFLOW
+#undef STATUS_FLOAT_UNDERFLOW
+#undef STATUS_ARRAY_BOUNDS_EXCEEDED
+#endif
 #define STATUS_BREAKPOINT 0x80000003u
 #define STATUS_LONGJUMP 0x80000026u
 #define STATUS_ACCESS_VIOLATION 0xc0000005u
@@ -86,6 +101,10 @@ int find_file(const char *dir, const char *name, char *out, size_t n); /* NAME i
 int find_program(const char *name, char *out, size_t n); /* the .exe for a command name; 0 if none */
 int wild_name(const char *pat, const char *name);        /* does NAME fit the pattern (* and ?) */
 u32 run_program(const char *hp, const char *line);       /* run it in a new ntrun, give its exit code */
+#ifdef _WIN32
+intptr_t start_program(const char *hp, const char *line); /* the same, without the wait: the process */
+u32 wait_program(intptr_t proc);                          /* wait for it, give its exit code */
+#endif
 void guest_exit(u32 code) __attribute__((noreturn));
 
 /* from cmd.c: the command processor */

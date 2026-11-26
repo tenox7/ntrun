@@ -1,0 +1,5 @@
+lines 1: [one]
+lines 2: [two]
+exit code 0
+exit code 3
+captured [captured] exit code 0

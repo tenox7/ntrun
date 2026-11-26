@@ -16,16 +16,58 @@
 
 here=$(cd "$(dirname "$0")" && pwd)
 ntrun=${NTRUN:-$here/../ntrun}
+# MSYS2 with a native Windows ntrun.exe: paths for ntrun have a drive (C:/dir), as the host has them
+if command -v cygpath >/dev/null 2>&1; then
+    [ -f "$ntrun.exe" ] && ntrun=$ntrun.exe
+    ntrun=$(cygpath -m "$ntrun")
+    hostpath() { cygpath -m "$1"; }
+    win() { cygpath -w "$1"; }
+    # with a folder as drive C: the host's C:\dir is Z:\c\dir for the tools
+    winz() { m=$(cygpath -m "$1"); d=$(echo "${m%%:*}" | tr A-Z a-z); echo "Z:/$d${m#*:}" | tr / '\\'; }
+    psep=';'
+else
+    hostpath() { echo "$1"; }
+    win() { echo "Z:$1" | tr / '\\'; }
+    winz() { win "$1"; }
+    psep=:
+fi
 tools=${1:-/opt}
 [ -d "$tools/nt40" ] || { echo "usage: run.sh [TOOLS [mips alpha ppc x86]]" >&2; exit 2; }
-tools=$(cd "$tools" && pwd)
+tools=$(hostpath "$(cd "$tools" && pwd)")
 [ $# -eq 0 ] || shift
 [ $# -gt 0 ] || set -- mips alpha ppc x86 axp64 ia64
-work=${WORK:-/tmp/ntrun-tests}
+work=$(hostpath "${WORK:-/tmp/ntrun-tests}")
 fail=0
 total=0
 
-win() { echo "Z:$1" | tr / '\\'; }
+
+# run_limited SECONDS COMMAND...: the command is stopped after that time (macOS has no timeout(1)).
+# A command that had to be stopped writes a line about it to its own output, so that its test fails.
+run_limited() {
+    t=$1
+    shift
+    flag=run_limited.stopped
+    rm -f "$flag"
+    "$@" &
+    p=$!
+    # the watch ends by itself soon after the command (it is not killed: a shell would report it)
+    ( i=0
+      while [ "$i" -lt "$t" ] && kill -0 "$p" 2> /dev/null; do
+          sleep 1
+          i=$((i + 1))
+      done
+      if kill -0 "$p" 2> /dev/null; then : > "$flag"; kill "$p" 2> /dev/null; fi ) > /dev/null 2>&1 &
+    k=$!
+    wait "$p"
+    r=$?
+    wait "$k" 2> /dev/null
+    if [ -f "$flag" ]; then
+        rm -f "$flag"
+        echo "stopped: it did not end in $t seconds"
+        return 1
+    fi
+    return $r
+}
 
 check() { # check NAME CPU: compare NAME.txt with the expected output
     exp=$here/$1.out
@@ -52,6 +94,11 @@ check cmdtest cmd
 # a drive letter for a host folder
 NTRUN_DRIVE_Q=$d $ntrun cmd /c "cd& if exist q:\\cmdtest.bat echo found& md sub& cd sub& cd& cd ..& rd sub" > drive.txt 2>&1
 check drive cmd
+# a pipeline whose second command ends without reading, with a first command that writes 139264 bytes:
+# it must end (a first command that holds its own pipe waits for ever)
+cp "$here"/pipe.bat "$d"/
+run_limited ${PIPE_LIMIT:-60} $ntrun cmd /c pipe.bat > pipe.txt 2>&1
+check pipe cmd
 
 for cpu in "$@"; do
     echo "== $cpu"
@@ -71,8 +118,8 @@ for cpu in "$@"; do
         NTRUN_PATH='C:\mssdk\bin\win64;C:\mssdk\bin;C:\vc98\bin'
         INCLUDE='C:\mssdk\include;C:\mssdk\include\win64\crt'
         LIB='C:\mssdk\lib\win64;C:\mssdk\lib\win64\crt'
-        NTRUN_DLLPATH=$a/vc98/redist:$tools/sys/alpha
-        TMP="$(win "$d")"
+        NTRUN_DLLPATH=$a/vc98/redist$psep$tools/sys/alpha
+        TMP="$(winz "$d")"
         CL=-Ap64
         export NTRUN_DRIVE_C NTRUN_PATH INCLUDE LIB NTRUN_DLLPATH TMP CL
         $ntrun cl -nologo -GX eh.cpp > eh.build 2>&1
@@ -96,7 +143,7 @@ for cpu in "$@"; do
         INCLUDE='C:\mssdk\include\crt;C:\mssdk\include'
         LIB='C:\mssdk\lib\ia64'
         NTRUN_DLLPATH=$tools/sys/x86
-        TMP="$(win "$d")"
+        TMP="$(winz "$d")"
         LINK=bufferoverflowu.lib
         export NTRUN_DRIVE_C NTRUN_PATH INCLUDE LIB NTRUN_DLLPATH TMP LINK
         $ntrun cl -nologo -EHsc eh.cpp > eh.build 2>&1
@@ -113,7 +160,7 @@ for cpu in "$@"; do
     INCLUDE="$(win "$v/include")"
     LIB="$(win "$v/lib")"
     TMP="$(win "$d")"
-    NTRUN_DLLPATH=$v/redist:$tools/sys/$cpu
+    NTRUN_DLLPATH=$v/redist$psep$tools/sys/$cpu
     NTRUN_PATH="$(win "$v/bin")"
     unset NTRUN_DRIVE_C
     export INCLUDE LIB TMP NTRUN_DLLPATH NTRUN_PATH
@@ -148,6 +195,12 @@ for cpu in "$@"; do
     # the MD5 and SHA-1 sums of the system
     $cl hash.c > hash.build 2>&1 && $ntrun hash.exe > hash.txt 2>&1
     check hash $cpu
+    # a pipe from a child process: _popen, and a pipe of CreatePipe as the output of the child
+    $cl popen.c > popen.build 2>&1 && $ntrun popen.exe > popen.txt 2>&1
+    check popen $cpu
+    # a view of a file that can be written is the file: the views, ReadFile and WriteFile agree
+    $cl mapview.c > mapview.build 2>&1 && $ntrun mapview.exe > mapview.txt 2>&1
+    check mapview $cpu
     # mc, rc, lib, a DLL and a program that uses them
     if [ -f tools.mak ]; then
         $ntrun $v/bin/NMAKE.EXE -nologo -f tools.mak > tools.build 2>&1 && $ntrun app.exe > tools.txt 2>&1

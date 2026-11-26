@@ -1,6 +1,7 @@
 # ntrun
 
 Runs Windows NT console programs made for MIPS, Alpha AXP, PowerPC or x86 on macOS or Linux.
+Windows 10 and later is supported as a host too, but that is experimental (see "Build on Windows").
 Its job: run the original build tools of the NT SDKs and of Visual C++
 (cl, link, lib, nmake, rc, mc, midl ...) without a VM and without Wine,
 and run the console programs that these tools build.
@@ -45,6 +46,35 @@ or
 - `x86args.h` is made by `tools/x86args.pl` from the import libraries of the SDKs (see the script).
   Make it again when you add a Windows function to `ntrun.c`.
 
+## Build on Windows (experimental)
+
+ntrun builds as a native Windows program with MSYS2, in the UCRT64 or the MINGW64 shell (gcc), with no
+Cygwin layer:
+
+    pacman -S make mingw-w64-ucrt-x86_64-gcc      # once, in the MSYS2 UCRT64 shell
+    pacman -S make mingw-w64-x86_64-gcc           # or in the MINGW64 shell
+    make CC=gcc
+
+UCRT64 is the preferred one. The C library of MINGW64 (`msvcrt.dll`) has an `fma` that is not exactly rounded,
+so a MINGW64 build uses its own (`softfma.h`) for the multiply-add of the PowerPC.
+
+- The Makefile links the program statically on Windows, so that a program that ntrun starts
+  does not need the DLLs of MSYS2 on its `PATH`.
+- The program has a manifest (`ntrun.manifest`, put in by `windres`) that makes it aware of paths longer than
+  259 characters. Windows uses it only when `LongPathsEnabled` is 1 in the registry
+  (`HKLM\SYSTEM\CurrentControlSet\Control\FileSystem`); otherwise the limit of Windows stays 259.
+  A program of Windows cannot start in a folder with a path longer than 259 characters.
+- Run it from an MSYS2 shell with `MSYS2_ARG_CONV_EXCL="*"`: otherwise MSYS changes an argument
+  like `/c` into a path.
+- `NTRUN_DLLPATH` has `;` between the folders on Windows (a drive letter has `:`).
+- Host paths have a drive: `C:/dir`. If you give a folder for a drive (`NTRUN_DRIVE_C`), the program sees
+  the host's `C:\dir` as `Z:\c\dir`; `Z:\dir` is below the root of the system drive.
+- Memory is committed as the program allocates it. A file view that the program can write is
+  a real view of the file when the view is made with no address and the offset is a multiple of
+  64 KB; a view that cannot be mapped is a copy that is written back to the file when the program
+  flushes, reads or writes the file, closes it or ends.
+- Windows is a host of the same ntrun: the tests below run on it too.
+
 ## Use
 
     ntrun [-a] [-t] PROGRAM [arguments]
@@ -60,7 +90,7 @@ Environment variables:
 | Variable | Use |
 |---|---|
 | `NTRUN_PATH` | The `PATH` of the program: Windows folders with `;` between them. Default: the folder of the program. |
-| `NTRUN_DLLPATH` | Host folders with DLLs, with `:` between them. |
+| `NTRUN_DLLPATH` | Host folders with DLLs, with `:` between them (`;` on Windows). |
 | `NTRUN_DRIVE_C` (any letter) | A host folder for that drive: `NTRUN_DRIVE_C=/opt/nt` makes `C:\MSTOOLS` the folder `/opt/nt/MSTOOLS`. |
 | `NTRUN_TRACE` | 1 or 2: the same as `-a` or `-a -a`, also for the programs that the program starts. |
 | `INCLUDE`, `LIB`, `TMP` ... | Go to the program as they are. Give Windows paths. |
@@ -118,17 +148,21 @@ So the tests run in the image, with the ntrun of the image or with a new one:
     docker run --rm -v "$PWD":/ntrun tenox7/ntsdk sh /ntrun/tests/run.sh      # ./ntrun, a static Linux binary
 
 On macOS, with the ntsdk repository next to this one: `tests/run.sh ../ntsdk/tools`.
+On Windows (MSYS2), the same, with `MSYS2_ARG_CONV_EXCL="*"` set: `tests/run.sh ../ntsdk/tools`.
 
 Builds the test programs with Visual C++ 4.x under ntrun and runs them under ntrun:
 exceptions (`seh`, `jmpex`, `eh`), thread-local data (`tls`), threads (`thread`),
 arithmetic (`num`, `fpx`), the math functions of the C library (`math`), the x87 (`x87`, for x86 only),
 the MD5 and SHA-1 sums of the system (`hash`, against the values that `md5` and `shasum` give),
-the tools (`tools`: mc, rc, lib, a DLL) and the command processor (`cmdtest.bat`, `drive`).
+the tools (`tools`: mc, rc, lib, a DLL), a pipe from a child process (`popen`: `_popen` and the pipe of `CreatePipe`),
+file views that agree with the file (`mapview`) and the command processor (`cmdtest.bat`, `drive`, and `pipe`:
+a pipeline whose second command ends without reading must not hang).
 `axp64` builds a C++ program, a DLL and a program with resources with the tools for 64-bit Alpha
 (`nt50/axp64` of TOOLS) and reads the headers of the files: ntrun cannot run them.
 `ia64` does the same with the cross compiler for Itanium (`nt52/ia64` of TOOLS).
 The `*.out` files are what the same programs printed on real Windows NT 3.51
-(MIPS, Alpha, PowerPC and x86 VMs; `cmdtest` on CMD.EXE of NT 3.51).
+(MIPS, Alpha, PowerPC and x86 VMs; `cmdtest` on CMD.EXE of NT 3.51). `popen.out` and `mapview.out` are what the
+programs must print by the rules of Windows; they were not made on a real NT system.
 The CPUs are not the same in floating point, and each has its own C library: `num`, `fpx` and `math`
 have one file for each CPU. `math` prints a sum of the bits of 12000 results (`exp`, `log`, `pow`,
 `atan`, `sinh`, `fmod` ...): on each of the four CPUs it is the same as on real Windows NT.
